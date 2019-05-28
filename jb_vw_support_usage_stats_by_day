@@ -1,0 +1,126 @@
+create or replace view product_usage_analyst_general.jb_vw_support_usage_stats_by_day
+as 
+(
+select
+date(a.created_at) as date
+, signups
+, suite_trials
+, support_trials
+, website_trial_suite
+, other
+, wins_by_created_at_pop
+, wins_by_created_at_der
+, wins_by_win_dt_pop
+, wins_by_win_dt_der
+, signups_der
+
+from
+(
+--Aggregates the number of total signups, as well as signups broken out by suite and support only by created_at date
+select c.created_at
+, sum(case when trial_typ = 'Suite' then 1 else 0 end) as suite_trials
+, sum(case when trial_typ = 'Support' then 1 else 0 end) as support_trials
+, sum(case when trial_typ = 'Website Trial - Suite' then 1 else 0 end) as website_trial_suite
+--create a catch all bucket for non suite/support/website trials or nulls
+, sum(case when trial_typ not in ('Suite', 'Support', 'Website Trial - Suite') or trial_typ is null then 1 else 0 end) as other
+, count(c.account_id) as signups
+from
+(
+--Tagging accounts as suite or support
+  select a.account_id
+  , a.created_at
+  , case b.suite_trial
+    when 'true' then 'Suite' 
+    when 'false' then 'Support' 
+    when 'Website Trial - Suite' then 'Website Trial - Suite' 
+    else b.suite_trial
+    end as trial_typ
+  from
+  (
+    select *
+    from `edw-prod-153420.pdw.redshift_account` r
+    where date(r.created_at) /*between '2019-01-01' and '2019-03-31'*/ >= '2017-01-01'
+      and r.multiproduct = 0 -- uncomment to only include regular suite/support trials, and exclude chat phase four
+      and r.derived_account_type in ('Trial', 'Trial - expired', 'Customer', 'Churned', 'Unclassified')
+  ) a
+  left join
+  --Query identifies a trial as support or suite through the trial_extra_key and trial_extra_value combination
+  --a trial_extra_key of suite_trial + true is a suite trial, and a key of suite_trial + false is a support-only trial
+  (
+    select t.account_id
+    , t.trial_extra_key
+    , t.trial_extra_value suite_trial
+    from `edw-prod-153420.pdw.trial_extras` t
+    where t.trial_extra_key = 'suite_trial' -- and trial_extra_value = 'true'
+  ) b
+  on a.account_id = b.account_id
+  group by 1,2,3
+  --having account_id is not null
+) c
+group by 1
+--having trial_typ = 'Suite'
+) a
+full outer join
+(
+  --identifies wins at the created date based on the pop/financial tables
+  --Have Devin walk me through this logic
+  select created_at
+  , count(distinct c.zendesk_account_id) wins_by_created_at_pop
+  from `edw-prod-153420.edw_financials.mtd_mrr_product` a
+    left join `edw-prod-153420.edw_consolidated.edw_date_dim` b on b.the_date = a.mrr_date
+    left join `edw-prod-153420.edw_consolidated.customer_dim_scd2` c on c.crm_account_id = a.crm_account_id and dw_curr_ind = 'Y'
+    left join `edw-prod-153420.pdw.derived_account_view` r on r.account_id = cast(cast(c.zendesk_account_id as float64) as int64)
+    where (last_day_of_mo_ind = 'Y' or mrr_date = date_sub(current_date(),interval 1 day))
+      and mtd_mrr_diff_type_transfer_adj = 'Product New'
+      and mrr_date > '2017-01-01' and date(created_at) >= '2017-01-01'
+      and product_line = 'Support'
+  group by 1
+) w22 on date(a.created_at) = date(w22.created_at)
+full outer join
+(
+  --identifies wins at the created date based on the derived_account_view table
+  --
+  select created_at, count(win_dt) as wins_by_created_at_der
+  from `edw-prod-153420.pdw.derived_account_view` d
+  where created_at >= timestamp('2017-01-01')
+    and derived_account_type in ('Trial', 'Trial - expired', 'Customer', 'Churned', 'Unclassified')
+  group by 1
+) w2 on date(a.created_at) = date(w2.created_at)
+full outer join
+(
+  --identifies wins at the win date based on the pop/financial tables
+  --follow up with Youngeun about the pop/financial tables and what the mrr_date represents
+  select mrr_date
+  , count(distinct c.zendesk_account_id) wins_by_win_dt_pop
+  from `edw-prod-153420.edw_financials.dod_mrr_crm` a
+    left join `edw-prod-153420.edw_consolidated.customer_dim_scd2` c on c.crm_account_id = a.crm_account_id and dw_curr_ind = 'Y'
+    left join `edw-prod-153420.pdw.derived_account_view` d on d.account_id = cast(cast(c.zendesk_account_id as float64) as int64)
+    where mrr_date >= ('2017-01-01')
+      and dod_mrr_diff_type_transfer_adj = 'Customer New'
+  group by 1
+) w33 on date(a.created_at) = w33.mrr_date
+full outer join
+(
+  --identifies wins at the win date based on the derived_account_view table
+  --
+  select win_dt
+  , count(win_dt) as wins_by_win_dt_der
+  from `edw-prod-153420.pdw.derived_account_view`
+  where win_dt >= '2017-01-01'
+    and derived_account_type in ('Trial', 'Trial - expired', 'Customer', 'Churned', 'Unclassified')
+  group by 1
+) w3 on date(a.created_at) = w3.win_dt
+
+--order by 1
+
+--bringing in signups according to the derived_account_view table |(this calculation includes chat version 4 )|
+full outer join
+( 
+SELECT r.created_at, COUNT(r.account_id) as signups_der    
+        FROM `edw-prod-153420.pdw.derived_account_view` r    
+        WHERE r.created_at >= TIMESTAMP("2017-01-01")      
+        AND derived_account_type IN ("Trial","Trial - expired","Customer","Churned","Unclassified")      
+        GROUP BY 1
+        ) s ON DATE(a.created_at) = DATE(s.created_at)
+order by 1
+)
